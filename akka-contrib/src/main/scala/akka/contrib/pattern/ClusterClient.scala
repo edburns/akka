@@ -29,6 +29,8 @@ import akka.routing.ConsistentHash
 import akka.routing.MurmurHash
 import akka.actor.Stash
 import akka.actor.Cancellable
+import akka.remote.DeadlineFailureDetector
+import akka.actor.DeadLetterSuppression
 
 object ClusterClient {
 
@@ -79,6 +81,7 @@ object ClusterClient {
    */
   private[pattern] object Internal {
     case object RefreshContactsTick
+    case object HeartbeatTick
   }
 }
 
@@ -125,10 +128,21 @@ class ClusterClient(
   import ClusterClient.Internal._
   import ClusterReceptionist.Internal._
 
+  def config = context.system.settings.config
+  val heartbeatInterval =
+    config.getDuration("akka.contrib.cluster.client.heartbeat-interval", MILLISECONDS).millis
+  val failureDetector = {
+    val acceptableHeartbeatPause =
+      config.getDuration("akka.contrib.cluster.client.acceptable-heartbeat-pause", MILLISECONDS).millis
+    new DeadlineFailureDetector(acceptableHeartbeatPause)
+  }
+
   var contacts: immutable.IndexedSeq[ActorSelection] = initialContacts.toVector
   sendGetContacts()
 
   import context.dispatcher
+  val heartbeatTask = context.system.scheduler.schedule(
+    heartbeatInterval, heartbeatInterval, self, HeartbeatTick)
   var refreshContactsTask: Option[Cancellable] = None
   scheduleRefreshContactsTick(establishingGetContactsInterval)
   self ! RefreshContactsTick
@@ -141,6 +155,7 @@ class ClusterClient(
 
   override def postStop(): Unit = {
     super.postStop()
+    heartbeatTask.cancel()
     refreshContactsTask foreach { _.cancel() }
   }
 
@@ -153,13 +168,13 @@ class ClusterClient(
         contacts foreach { _ ! Identify(None) }
       }
     case ActorIdentity(_, Some(receptionist)) ⇒
-      context watch receptionist
       log.info("Connected to [{}]", receptionist.path)
-      context.watch(receptionist)
       scheduleRefreshContactsTick(refreshContactsInterval)
       unstashAll()
       context.become(active(receptionist))
+      failureDetector.heartbeat()
     case ActorIdentity(_, None) ⇒ // ok, use another instead
+    case HeartbeatTick          ⇒ failureDetector.heartbeat()
     case RefreshContactsTick    ⇒ sendGetContacts()
     case msg                    ⇒ stash()
   }
@@ -171,17 +186,23 @@ class ClusterClient(
       receptionist forward DistributedPubSubMediator.SendToAll(path, msg)
     case Publish(topic, msg) ⇒
       receptionist forward DistributedPubSubMediator.Publish(topic, msg)
+    case HeartbeatTick ⇒
+      if (!failureDetector.isAvailable) {
+        log.info("Lost contact with [{}], restablishing connection", receptionist)
+        sendGetContacts()
+        scheduleRefreshContactsTick(establishingGetContactsInterval)
+        context.become(establishing)
+        failureDetector.heartbeat()
+      } else
+        receptionist ! Heartbeat
+    case HeartbeatRsp ⇒
+      failureDetector.heartbeat()
     case RefreshContactsTick ⇒
       receptionist ! GetContacts
     case Contacts(contactPoints) ⇒
       // refresh of contacts
       if (contactPoints.nonEmpty)
         contacts = contactPoints
-    case Terminated(`receptionist`) ⇒
-      log.info("Lost contact with [{}], restablishing connection", receptionist)
-      sendGetContacts()
-      scheduleRefreshContactsTick(establishingGetContactsInterval)
-      context.become(establishing)
     case _: ActorIdentity ⇒ // ok, from previous establish, already handled
   }
 
@@ -311,9 +332,13 @@ object ClusterReceptionist {
    */
   private[pattern] object Internal {
     @SerialVersionUID(1L)
-    case object GetContacts
+    case object GetContacts extends DeadLetterSuppression
     @SerialVersionUID(1L)
     case class Contacts(contactPoints: immutable.IndexedSeq[ActorSelection])
+    @SerialVersionUID(1L)
+    case object Heartbeat extends DeadLetterSuppression
+    @SerialVersionUID(1L)
+    case object HeartbeatRsp extends DeadLetterSuppression
     @SerialVersionUID(1L)
     case object Ping
 
@@ -328,12 +353,10 @@ object ClusterReceptionist {
      */
     class ClientResponseTunnel(client: ActorRef, timeout: FiniteDuration) extends Actor {
       context.setReceiveTimeout(timeout)
-      context.watch(client)
       def receive = {
-        case Ping                 ⇒ // keep alive from client
-        case ReceiveTimeout       ⇒ context stop self
-        case Terminated(`client`) ⇒ context stop self
-        case msg                  ⇒ client forward msg
+        case Ping           ⇒ // keep alive from client
+        case ReceiveTimeout ⇒ context stop self
+        case msg            ⇒ client forward msg
       }
     }
   }
@@ -421,6 +444,9 @@ class ClusterReceptionist(
       val tunnel = responseTunnel(sender())
       tunnel ! Ping // keep alive
       pubSubMediator.tell(msg, tunnel)
+
+    case Heartbeat ⇒
+      sender() ! HeartbeatRsp
 
     case GetContacts ⇒
       // Consistent hashing is used to ensure that the reply to GetContacts
