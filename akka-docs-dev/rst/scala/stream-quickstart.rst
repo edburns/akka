@@ -73,7 +73,7 @@ The complete snippet looks like this:
 Flattening sequences in streams
 -------------------------------
 In the previous section we were working on 1:1 relationships of elements which is the most common case, but sometimes
-we might want to map from one element to a number of elements and receive a "flattened" stream, similarly like ``flatMap``
+we might want to map from one element to a number of elements and receive a "flattened" stream, similar to how ``flatMap``
 works on Scala Collections. In order to get a flattened stream of hashtags from our stream of tweets we can use the ``mapConcat``
 combinator:
 
